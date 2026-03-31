@@ -3,6 +3,8 @@ use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::str;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -70,17 +72,50 @@ pub fn media_worker(
     max_frames: Option<usize>,
     array_q_s: Sender<WebpItem>,
     progress_sender: Sender<usize>,
+    cancel_flag: Arc<AtomicBool>,
 ) {
+    if cancel_flag.load(Ordering::Relaxed) {
+        if &file.file_path != &file.tmp_path {
+            let _ = remove_file_with_retries(&file.tmp_path, 3, Duration::from_secs(1));
+        }
+        return;
+    }
     let mut parser = MediaParser::new();
     let mut resizer = Resizer::new();
     if let Some(extension) = file.file_path.extension() {
         let array_q_s = array_q_s.clone();
         match extension.to_str().unwrap().to_lowercase().as_str() {
             "jpg" | "jpeg" | "png" => {
-                process_image(&file, imgsz, quality, &mut parser, &mut resizer, array_q_s).unwrap();
+                if let Err(e) =
+                    process_image(&file, imgsz, quality, &mut parser, &mut resizer, array_q_s)
+                {
+                    log::error!(
+                        "Failed to process image {}: {}",
+                        file.file_path.display(),
+                        e
+                    );
+                    cancel_flag.store(true, Ordering::Relaxed);
+                    if &file.file_path != &file.tmp_path {
+                        let _ = remove_file_with_retries(&file.tmp_path, 3, Duration::from_secs(1));
+                    }
+                    return;
+                }
             }
             "mp4" | "avi" | "mkv" | "mov" => {
-                process_video(&file, imgsz, quality, iframe, max_frames, array_q_s).unwrap();
+                if let Err(e) =
+                    process_video(&file, imgsz, quality, iframe, max_frames, array_q_s)
+                {
+                    log::error!(
+                        "Failed to process video {}: {}",
+                        file.file_path.display(),
+                        e
+                    );
+                    cancel_flag.store(true, Ordering::Relaxed);
+                    if &file.file_path != &file.tmp_path {
+                        let _ = remove_file_with_retries(&file.tmp_path, 3, Duration::from_secs(1));
+                    }
+                    return;
+                }
             }
             _ => (),
         }
@@ -199,10 +234,13 @@ pub fn process_image(
             error,
         }),
     };
-    match array_q_s.send(frame_data) {
-        Ok(_) => (),
-        Err(_e) => log::error!("Failed to send frame data, channel disconnected"),
-    }
+    array_q_s
+        .send(frame_data)
+        .map_err(|e| anyhow::anyhow!(
+            "Failed to send frame data for {}: {}",
+            file.file_path.display(),
+            e
+        ))?;
     Ok(())
 }
 
@@ -393,12 +431,13 @@ fn handle_ffmpeg_output(
             error,
         });
         if let Err(e) = s.send(frame_data) {
-            log::error!(
+            let err_msg = format!(
                 "Failed to send ffmpeg error frame for {}: {}",
                 file.file_path.display(),
                 e
             );
-            return Ok(());
+            log::error!("{}", err_msg);
+            return Err(anyhow!(err_msg));
         }
     } else {
         let sampled_frames = sample_evenly(&frames, max_frames.unwrap_or(frames.len()));
@@ -430,12 +469,13 @@ fn handle_ffmpeg_output(
                 iframe,
             });
             if let Err(e) = s.send(frame_data) {
-                log::error!(
+                let err_msg = format!(
                     "Failed to send frame data for {}: {}",
                     file.file_path.display(),
                     e
                 );
-                return Ok(());
+                log::error!("{}", err_msg);
+                return Err(anyhow!(err_msg));
             }
         }
     }
