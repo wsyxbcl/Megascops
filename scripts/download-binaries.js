@@ -16,6 +16,8 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const binaryDir = path.join(__dirname, "..", "src-tauri", "binaries");
+const ORGANIZE_RELEASE_BASE_URL =
+    "https://github.com/wsyxbcl/organize/releases/download/v0.1.1%2Bmazefork.1";
 
 const rustInfo = execSync("rustc -vV");
 const targetTriple = /host: (\S+)/g.exec(rustInfo)[1];
@@ -94,7 +96,7 @@ function getOrganizeInfo() {
 
     if (targetTriple === "x86_64-pc-windows-msvc") {
         return {
-            url: "https://github.com/simulacraliasing/organize/releases/download/v0.1.0/organize-x86_64-pc-windows-msvc.exe",
+            url: `${ORGANIZE_RELEASE_BASE_URL}/organize-x86_64-pc-windows-msvc.exe`,
             outputPath: path.join(
                 binaryDir,
                 "organize-x86_64-pc-windows-msvc.exe"
@@ -102,17 +104,17 @@ function getOrganizeInfo() {
         };
     } else if (targetTriple === "aarch64-apple-darwin") {
         return {
-            url: "https://github.com/simulacraliasing/organize/releases/download/v0.1.0/organize-aarch64-apple-darwin",
+            url: `${ORGANIZE_RELEASE_BASE_URL}/organize-aarch64-apple-darwin`,
             outputPath: path.join(binaryDir, "organize-aarch64-apple-darwin"),
         };
     } else if (targetTriple === "x86_64-apple-darwin") {
         return {
-            url: "https://github.com/simulacraliasing/organize/releases/download/v0.1.0/organize-x86_64-apple-darwin",
+            url: `${ORGANIZE_RELEASE_BASE_URL}/organize-x86_64-apple-darwin`,
             outputPath: path.join(binaryDir, "organize-x86_64-apple-darwin"),
         };
     } else if (targetTriple === "x86_64-unknown-linux-gnu") {
         return {
-            url: "https://github.com/simulacraliasing/organize/releases/download/v0.1.0/organize-x86_64-unknown-linux-gnu",
+            url: `${ORGANIZE_RELEASE_BASE_URL}/organize-x86_64-unknown-linux-gnu`,
             outputPath: path.join(
                 binaryDir,
                 "organize-x86_64-unknown-linux-gnu"
@@ -120,7 +122,7 @@ function getOrganizeInfo() {
         };
     } else if (targetTriple === "aarch64-unknown-linux-gnu") {
         return {
-            url: "https://github.com/simulacraliasing/organize/releases/download/v0.1.0/organize-aarch64-unknown-linux-gnu",
+            url: `${ORGANIZE_RELEASE_BASE_URL}/organize-aarch64-unknown-linux-gnu`,
             outputPath: path.join(
                 binaryDir,
                 "organize-aarch64-unknown-linux-gnu"

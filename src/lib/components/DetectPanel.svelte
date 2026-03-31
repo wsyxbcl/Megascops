@@ -107,7 +107,7 @@
     const formattedQuota = $derived(formatQuota(detectStatus.quota));
 
     function openGithub() {
-        open("https://github.com/simulacraliasing/Megascops");
+        open("https://github.com/wsyxbcl/Megascops");
     }
 </script>
 
