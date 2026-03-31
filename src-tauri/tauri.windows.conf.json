@@ -1,11 +1,18 @@
 {
-    "app": {
-      "windows": [
-        {
-          "title": "Megascops",
-          "width": 640,
-          "height": 458
-        }
-      ]
+  "app": {
+    "windows": [
+      {
+        "title": "Megascops",
+        "width": 640,
+        "height": 458
+      }
+    ]
+  },
+  "bundle": {
+    "windows": {
+      "wix": {
+        "version": "0.2.1.1"
+      }
     }
   }
+}
