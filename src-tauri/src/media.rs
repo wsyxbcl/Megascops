@@ -22,6 +22,7 @@ use nom_exif::{EntryValue, Exif, ExifIter, ExifTag, MediaParser, MediaSource};
 use thiserror::Error;
 use webp::Encoder;
 
+use crate::ExportFrame;
 use crate::utils::{sample_evenly, FileItem};
 
 //define meadia error
@@ -71,6 +72,7 @@ pub fn media_worker(
     iframe: bool,
     max_frames: Option<usize>,
     array_q_s: Sender<WebpItem>,
+    export_q_s: Sender<ExportFrame>,
     progress_sender: Sender<usize>,
     cancel_flag: Arc<AtomicBool>,
 ) {
@@ -94,6 +96,7 @@ pub fn media_worker(
                         file.file_path.display(),
                         e
                     );
+                    send_export_error(&export_q_s, &file, &e);
                     cancel_flag.store(true, Ordering::Relaxed);
                     if &file.file_path != &file.tmp_path {
                         let _ = remove_file_with_retries(&file.tmp_path, 3, Duration::from_secs(1));
@@ -110,6 +113,7 @@ pub fn media_worker(
                         file.file_path.display(),
                         e
                     );
+                    send_export_error(&export_q_s, &file, &e);
                     cancel_flag.store(true, Ordering::Relaxed);
                     if &file.file_path != &file.tmp_path {
                         let _ = remove_file_with_retries(&file.tmp_path, 3, Duration::from_secs(1));
@@ -153,6 +157,26 @@ fn remove_file_with_retries(file_path: &PathBuf, max_retries: u32, delay: Durati
     }
 
     Ok(())
+}
+
+fn send_export_error(export_q_s: &Sender<ExportFrame>, file: &FileItem, error: &anyhow::Error) {
+    let export_frame = ExportFrame {
+        file: file.clone(),
+        shoot_time: None,
+        frame_index: 0,
+        total_frames: 0,
+        bboxes: None,
+        label: None,
+        error: Some(error.to_string()),
+        iframe: false,
+    };
+    if let Err(send_err) = export_q_s.send(export_frame) {
+        log::error!(
+            "Failed to write error result for {}: {}",
+            file.file_path.display(),
+            send_err
+        );
+    }
 }
 
 fn decode_image(file: &FileItem) -> Result<DynamicImage> {
@@ -313,7 +337,20 @@ pub fn process_video(
             return Ok(());
         }
     };
-    let input = create_ffmpeg_iter(&video_path, imgsz, iframe)?;
+    let input = match create_ffmpeg_iter(&video_path, imgsz, iframe) {
+        Ok(input) => input,
+        Err(error) => {
+            log::error!("Failed to create ffmpeg iterator: {}", error);
+            let err_file = WebpItem::ErrFile(ErrFile {
+                file: file.clone(),
+                error: error.context("Failed to create ffmpeg iterator"),
+            });
+            array_q_s
+                .send(err_file)
+                .context("Failed to send ffmpeg iterator error")?;
+            return Ok(());
+        }
+    };
 
     handle_ffmpeg_output(
         input, array_q_s, file, quality, max_frames, orig_w, orig_h, iframe,

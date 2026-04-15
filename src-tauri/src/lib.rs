@@ -182,6 +182,7 @@ async fn process(config: Config, progress_sender: crossbeam_channel::Sender<usiz
 
     if let Some(buffer_path) = buffer_path {
         let cancel_flag_clone = Arc::clone(&cancel_flag);
+        let export_q_s_for_media = export_q_s.clone();
         rayon::spawn(move || {
             std::fs::create_dir_all(&buffer_path).unwrap();
             let buffer_path = std::fs::canonicalize(buffer_path).unwrap();
@@ -208,6 +209,7 @@ async fn process(config: Config, progress_sender: crossbeam_channel::Sender<usiz
                     config.config_options.iframe_only,
                     config.config_options.max_frames,
                     media_q_s.clone(),
+                    export_q_s_for_media.clone(),
                     progress_sender_clone.clone(),
                     Arc::clone(&cancel_flag_clone),
                 );
@@ -216,6 +218,7 @@ async fn process(config: Config, progress_sender: crossbeam_channel::Sender<usiz
         });
     } else {
         let cancel_flag_clone = Arc::clone(&cancel_flag);
+        let export_q_s_for_media = export_q_s.clone();
         rayon::spawn(move || {
             file_paths.par_iter().for_each(|file| {
                 if cancel_flag_clone.load(Ordering::Relaxed) {
@@ -228,6 +231,7 @@ async fn process(config: Config, progress_sender: crossbeam_channel::Sender<usiz
                     config.config_options.iframe_only,
                     config.config_options.max_frames,
                     media_q_s.clone(),
+                    export_q_s_for_media.clone(),
                     progress_sender_clone.clone(),
                     Arc::clone(&cancel_flag_clone),
                 );
@@ -440,20 +444,24 @@ fn resume_from_checkpoint<'a>(
                 }
                 let mut file_frame_count = HashMap::new();
                 let mut file_total_frames = HashMap::new();
+                let mut file_has_error = HashMap::new();
                 for f in &frames {
                     let file = &f.file;
+                    if f.error.is_some() {
+                        file_has_error.insert(file.clone(), true);
+                        continue;
+                    }
                     let count = file_frame_count.entry(file.clone()).or_insert(0);
                     *count += 1;
                     file_total_frames
                         .entry(file.clone())
                         .or_insert(f.total_frames);
-
-                    if let Some(total_frames) = file_total_frames.get(&file) {
-                        if let Some(frame_count) = file_frame_count.get(&file) {
-                            if total_frames == frame_count {
-                                all_files.remove(&file);
-                            }
-                        }
+                }
+                for (file, total_frames) in file_total_frames.iter() {
+                    let frame_count = file_frame_count.get(file).copied().unwrap_or(0);
+                    let has_error = file_has_error.get(file).copied().unwrap_or(false);
+                    if !has_error && *total_frames == frame_count {
+                        all_files.remove(file);
                     }
                 }
                 export_data.lock().unwrap().extend_from_slice(&frames);

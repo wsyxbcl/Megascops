@@ -49,19 +49,31 @@ pub fn parse_export_csv<P: AsRef<Path>>(csv: P) -> Result<Vec<ExportFrame>> {
         let bboxes = serde_json::from_str(&bboxes)?;
         let frame_item = ExportFrame {
             file: file_item,
-            shoot_time: Some(frame[3].to_string()),
+            shoot_time: if frame[3].is_empty() {
+                None
+            } else {
+                Some(frame[3].to_string())
+            },
             frame_index: frame[4].parse::<_>()?,
             total_frames: frame[5].parse::<_>()?,
             bboxes,
-            label: Some(
-                frame[8]
+            label: if frame[8].is_empty() {
+                None
+            } else {
+                Some(
+                    frame[8]
                     .to_string()
                     .split(";")
                     .map(|s| s.to_string())
                     .collect(),
-            ),
+                )
+            },
             iframe: frame[6].parse::<_>()?,
-            error: Some(frame[9].to_string()),
+            error: if frame[9].is_empty() {
+                None
+            } else {
+                Some(frame[9].to_string())
+            },
         };
         export_data.push(frame_item);
     }
