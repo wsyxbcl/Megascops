@@ -1,6 +1,6 @@
 [package]
 name = "Megascops"
-version = "0.2.1+mazefork.1"
+version = "0.2.1-mazefork.2"
 description = "A cameratrap media detection tool"
 authors = ["Zhengyi Dong <zhengyi.dong@outlook.com>"]
 edition = "2021"
