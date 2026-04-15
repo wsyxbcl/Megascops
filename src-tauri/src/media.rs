@@ -392,7 +392,14 @@ fn handle_ffmpeg_output(
             file: file.clone(),
             error,
         });
-        s.send(frame_data).expect("Send video frame failed");
+        if let Err(e) = s.send(frame_data) {
+            log::error!(
+                "Failed to send ffmpeg error frame for {}: {}",
+                file.file_path.display(),
+                e
+            );
+            return Ok(());
+        }
     } else {
         let sampled_frames = sample_evenly(&frames, max_frames.unwrap_or(frames.len()));
 
@@ -422,7 +429,14 @@ fn handle_ffmpeg_output(
                 shoot_time,
                 iframe,
             });
-            s.send(frame_data).expect("Send video frame failed");
+            if let Err(e) = s.send(frame_data) {
+                log::error!(
+                    "Failed to send frame data for {}: {}",
+                    file.file_path.display(),
+                    e
+                );
+                return Ok(());
+            }
         }
     }
     Ok(())
