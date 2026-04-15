@@ -24,6 +24,37 @@
     import { startTour } from "$lib/tour";
     import { getVersion } from "@tauri-apps/api/app";
 
+    interface DetectCompletePayload {
+        totalFiles: number;
+        skippedFiles: number;
+        processedFiles: number;
+        successFiles: number;
+        errorFiles: number;
+        resultPath: string;
+        errorReportPath: string | null;
+    }
+
+    function formatCompleteMessage(payload: DetectCompletePayload) {
+        const lines = [
+            $_("dialog.message.processComplete"),
+            "",
+            `${$_("dialog.summary.totalFiles")}: ${payload.totalFiles}`,
+            `${$_("dialog.summary.skippedFiles")}: ${payload.skippedFiles}`,
+            `${$_("dialog.summary.processedFiles")}: ${payload.processedFiles}`,
+            `${$_("dialog.summary.successFiles")}: ${payload.successFiles}`,
+            `${$_("dialog.summary.errorFiles")}: ${payload.errorFiles}`,
+            `${$_("dialog.summary.resultFile")}: ${payload.resultPath}`,
+        ];
+
+        if (payload.errorReportPath) {
+            lines.push(
+                `${$_("dialog.summary.errorReport")}: ${payload.errorReportPath}`,
+            );
+        }
+
+        return lines.join("\n");
+    }
+
     listen<boolean>("health-status", (event) => {
         let status = event.payload;
         if (status) {
@@ -37,9 +68,9 @@
         detectStatus.progress = event.payload;
     });
 
-    listen<number>("detect-complete", async (event) => {
+    listen<DetectCompletePayload | number>("detect-complete", async (event) => {
         let complete = event.payload;
-        if (complete === 1) {
+        if (typeof complete === "number") {
             detectStatus.progress = 100;
             detectStatus.isProcessing = false;
             await checkQuota();
@@ -47,6 +78,11 @@
                 $_("dialog.title.Success"),
                 $_("dialog.message.processComplete"),
             );
+        } else {
+            detectStatus.progress = 100;
+            detectStatus.isProcessing = false;
+            await checkQuota();
+            showDialog($_("dialog.title.Success"), formatCompleteMessage(complete));
         }
     });
 
@@ -99,7 +135,7 @@
         <AlertDialog.Content>
             <AlertDialog.Header>
                 <AlertDialog.Title>{dialogConfig.title}</AlertDialog.Title>
-                <AlertDialog.Description>
+                <AlertDialog.Description class="whitespace-pre-line">
                     {dialogConfig.description}
                 </AlertDialog.Description>
             </AlertDialog.Header>

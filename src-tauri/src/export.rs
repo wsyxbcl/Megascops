@@ -34,6 +34,18 @@ pub struct ExportFrame {
     pub iframe: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProcessSummary {
+    pub total_files: usize,
+    pub skipped_files: usize,
+    pub processed_files: usize,
+    pub success_files: usize,
+    pub error_files: usize,
+    pub result_path: String,
+    pub error_report_path: Option<String>,
+}
+
 pub fn parse_export_csv<P: AsRef<Path>>(csv: P) -> Result<Vec<ExportFrame>> {
     let file = File::open(csv)?;
     let mut rdr = csv::Reader::from_reader(file);
@@ -114,26 +126,24 @@ pub fn export_worker(
 fn replace_file_rows(
     export_data: &mut Vec<ExportFrame>,
     export_frame: &ExportFrame,
-    updated_files: &mut HashSet<FileItem>,
+    updated_files: &mut HashSet<PathBuf>,
 ) {
-    if updated_files.insert(export_frame.file.clone()) {
-        export_data.retain(|frame| frame.file != export_frame.file);
+    if updated_files.insert(export_frame.file.file_path.clone()) {
+        export_data.retain(|frame| frame.file.file_path != export_frame.file.file_path);
     }
 }
 
-fn write_json(export_data: &Vec<ExportFrame>, folder_path: &PathBuf) -> Result<()> {
+fn write_json<P: AsRef<Path>>(export_data: &[ExportFrame], path: P) -> Result<()> {
     let json = serde_json::to_string_pretty(export_data)?;
-    let json_path = folder_path.join("result.json");
-    let mut file = File::create(json_path)?;
+    let mut file = File::create(path)?;
     file.write_all(json.as_bytes())?;
     Ok(())
 }
 
-fn write_csv(export_data: &Vec<ExportFrame>, folder_path: &PathBuf) -> Result<()> {
-    let csv_path = folder_path.join("result.csv");
+fn write_csv<P: AsRef<Path>>(export_data: &[ExportFrame], path: P) -> Result<()> {
     let mut wtr = WriterBuilder::new()
         .has_headers(false)
-        .from_path(csv_path)?;
+        .from_path(path)?;
     wtr.write_record([
         "folder_id",
         "file_id",
@@ -184,18 +194,97 @@ pub fn export(
     folder_path: &PathBuf,
     export_data: Arc<Mutex<Vec<ExportFrame>>>,
     export_format: &ExportFormat,
-) -> Result<()> {
+) -> Result<ProcessSummary> {
     let export_data = export_data.lock().unwrap();
     log::info!("Exported {} frames", export_data.len());
+    let result_path = result_path(folder_path, export_format);
     match export_format {
         ExportFormat::Json => {
-            write_json(&export_data, folder_path)?;
+            write_json(&export_data, &result_path)?;
         }
         ExportFormat::Csv => {
-            write_csv(&export_data, folder_path)?;
+            write_csv(&export_data, &result_path)?;
         }
     }
-    Ok(())
+    Ok(ProcessSummary {
+        total_files: 0,
+        skipped_files: 0,
+        processed_files: 0,
+        success_files: 0,
+        error_files: 0,
+        result_path: result_path.to_string_lossy().into_owned(),
+        error_report_path: None,
+    })
+}
+
+pub fn finalize_run(
+    folder_path: &PathBuf,
+    export_data: Arc<Mutex<Vec<ExportFrame>>>,
+    export_format: &ExportFormat,
+    run_files: &HashSet<PathBuf>,
+    total_files: usize,
+    skipped_files: usize,
+) -> Result<ProcessSummary> {
+    let mut summary = export(folder_path, export_data, export_format)?;
+    summary.total_files = total_files;
+    summary.skipped_files = skipped_files;
+    summary.processed_files = run_files.len();
+
+    let export_data = std::fs::read_to_string(&summary.result_path)?;
+    let export_data: Vec<ExportFrame> = match export_format {
+        ExportFormat::Json => serde_json::from_str(&export_data)?,
+        ExportFormat::Csv => parse_export_csv(&summary.result_path)?,
+    };
+
+    let mut file_has_error = std::collections::HashMap::new();
+    let mut error_rows = Vec::new();
+    for frame in export_data.iter() {
+        if !run_files.contains(&frame.file.file_path) {
+            continue;
+        }
+        let has_error = frame.error.is_some();
+        file_has_error
+            .entry(frame.file.file_path.clone())
+            .and_modify(|current| *current |= has_error)
+            .or_insert(has_error);
+        if has_error {
+            error_rows.push(frame.clone());
+        }
+    }
+
+    summary.error_files = file_has_error.values().filter(|has_error| **has_error).count();
+    summary.success_files = summary
+        .processed_files
+        .saturating_sub(summary.error_files);
+    let error_report_path = error_report_path(folder_path, export_format);
+    if error_rows.is_empty() {
+        if error_report_path.exists() {
+            std::fs::remove_file(&error_report_path)?;
+        }
+        summary.error_report_path = None;
+    } else {
+        match export_format {
+            ExportFormat::Json => write_json(&error_rows, &error_report_path)?,
+            ExportFormat::Csv => write_csv(&error_rows, &error_report_path)?,
+        }
+        summary.error_report_path = Some(error_report_path.to_string_lossy().into_owned());
+    }
+
+    Ok(summary)
+}
+
+fn result_path(folder_path: &Path, export_format: &ExportFormat) -> PathBuf {
+    match export_format {
+        ExportFormat::Json => folder_path.join("result.json"),
+        ExportFormat::Csv => folder_path.join("result.csv"),
+    }
+}
+
+fn error_report_path(folder_path: &Path, export_format: &ExportFormat) -> PathBuf {
+    match export_format {
+        ExportFormat::Json => folder_path.join("result.errors.json"),
+        ExportFormat::Csv => folder_path.join("result.errors.csv"),
+    }
 }
 
 #[cfg(test)]

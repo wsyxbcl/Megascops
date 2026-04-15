@@ -32,7 +32,7 @@ pub mod io;
 pub mod media;
 pub mod utils;
 
-pub use export::{export_worker, parse_export_csv, Bbox, ExportFrame};
+pub use export::{export_worker, finalize_run, parse_export_csv, Bbox, ExportFrame, ProcessSummary};
 pub use media::{media_worker, WebpItem};
 pub use utils::FileItem;
 
@@ -111,7 +111,10 @@ async fn create_grpc_client(grpc_url: &str) -> Result<Channel> {
         .context("Failed to connect to server")
 }
 
-async fn process(config: Config, progress_sender: crossbeam_channel::Sender<usize>) -> Result<()> {
+async fn process(
+    config: Config,
+    progress_sender: crossbeam_channel::Sender<usize>,
+) -> Result<Option<ProcessSummary>> {
     let channel = create_grpc_client(&config.detect_options.grpc_url).await?;
 
     let mut client = Md5rsClient::new(channel);
@@ -123,7 +126,7 @@ async fn process(config: Config, progress_sender: crossbeam_channel::Sender<usiz
 
     if config.config_options.check_point == 0 {
         log::error!("Checkpoint should be greater than 0");
-        return Ok(());
+        return Ok(None);
     }
 
     let folder_path = std::path::PathBuf::from(&config.detect_options.selected_folder);
@@ -133,6 +136,7 @@ async fn process(config: Config, progress_sender: crossbeam_channel::Sender<usiz
     let start = Instant::now();
 
     let mut file_paths = utils::index_files_and_folders(&folder_path)?;
+    let total_files = file_paths.len();
 
     let export_data = Arc::new(Mutex::new(Vec::new()));
     let frames = Arc::new(Mutex::new(HashMap::<String, ExportFrame>::new()));
@@ -150,6 +154,11 @@ async fn process(config: Config, progress_sender: crossbeam_channel::Sender<usiz
         }
         None => file_paths,
     };
+    let skipped_files = total_files.saturating_sub(file_paths.len());
+    let run_files = file_paths
+        .iter()
+        .map(|file| file.file_path.clone())
+        .collect::<HashSet<_>>();
 
     let (media_q_s, media_q_r) = bounded(8);
     let (io_q_s, io_q_r) = bounded(config.config_options.buffer_size);
@@ -287,9 +296,11 @@ async fn process(config: Config, progress_sender: crossbeam_channel::Sender<usiz
         Err(status) => {
             log::error!("{}", status.message());
             cleanup_buffer(&config.config_options.buffer_path)?;
-            return Ok(());
+            return Ok(None);
         }
     };
+
+    let mut summary = None;
 
     loop {
         match inbound.message().await {
@@ -320,11 +331,14 @@ async fn process(config: Config, progress_sender: crossbeam_channel::Sender<usiz
                 while !*finish_clone.lock().unwrap() {
                     thread::sleep(Duration::from_millis(100));
                 }
-                export::export(
+                summary = Some(export::finalize_run(
                     &folder_path_clone,
                     export_data_clone,
                     &config.config_options.export_format,
-                )?;
+                    &run_files,
+                    total_files,
+                    skipped_files,
+                )?);
                 cleanup_buffer(&config.config_options.buffer_path)?;
                 break;
             }
@@ -335,10 +349,13 @@ async fn process(config: Config, progress_sender: crossbeam_channel::Sender<usiz
                 while !*finish_clone.lock().unwrap() {
                     thread::sleep(Duration::from_millis(100));
                 }
-                export::export(
+                let _ = export::finalize_run(
                     &folder_path_clone,
                     export_data_clone,
                     &config.config_options.export_format,
+                    &run_files,
+                    total_files,
+                    skipped_files,
                 )?;
                 cleanup_buffer(&config.config_options.buffer_path)?;
                 break;
@@ -353,7 +370,7 @@ async fn process(config: Config, progress_sender: crossbeam_channel::Sender<usiz
     }
 
     log::info!("Elapsed time: {:?}", start.elapsed());
-    Ok(())
+    Ok(summary)
 }
 
 async fn auth(client: &mut Md5rsClient<Channel>, token: &str) -> Result<AuthResponse> {
@@ -537,7 +554,10 @@ async fn process_media(app: AppHandle, config: Config) {
     });
 
     match process(config, progress_sender).await {
-        Ok(_) => {
+        Ok(Some(summary)) => {
+            app.emit("detect-complete", summary).unwrap();
+        }
+        Ok(None) => {
             app.emit("detect-complete", 1).unwrap();
         }
         Err(e) => {
