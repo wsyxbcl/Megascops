@@ -1,6 +1,9 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -153,6 +156,7 @@ async fn process(config: Config, progress_sender: crossbeam_channel::Sender<usiz
     let (export_q_s, export_q_r) = unbounded();
     let checkpoint_counter = Arc::new(Mutex::new(0 as usize));
     let progress_sender_clone = progress_sender.clone();
+    let cancel_flag = Arc::new(AtomicBool::new(false));
 
     let buffer_path = config.config_options.buffer_path.clone();
     let folder_path_clone = folder_path.clone();
@@ -177,18 +181,26 @@ async fn process(config: Config, progress_sender: crossbeam_channel::Sender<usiz
     });
 
     if let Some(buffer_path) = buffer_path {
+        let cancel_flag_clone = Arc::clone(&cancel_flag);
         rayon::spawn(move || {
             std::fs::create_dir_all(&buffer_path).unwrap();
             let buffer_path = std::fs::canonicalize(buffer_path).unwrap();
 
+            let cancel_for_io = Arc::clone(&cancel_flag_clone);
             let io_handle = thread::spawn(move || {
                 for file in file_paths.iter() {
+                    if cancel_for_io.load(Ordering::Relaxed) {
+                        break;
+                    }
                     io::io_worker(&buffer_path, file, io_q_s.clone()).unwrap();
                 }
                 drop(io_q_s);
             });
 
             io_q_r.iter().par_bridge().for_each(|file| {
+                if cancel_flag_clone.load(Ordering::Relaxed) {
+                    return;
+                }
                 media_worker(
                     file,
                     imgsz,
@@ -197,13 +209,18 @@ async fn process(config: Config, progress_sender: crossbeam_channel::Sender<usiz
                     config.config_options.max_frames,
                     media_q_s.clone(),
                     progress_sender_clone.clone(),
+                    Arc::clone(&cancel_flag_clone),
                 );
             });
             io_handle.join().unwrap();
         });
     } else {
+        let cancel_flag_clone = Arc::clone(&cancel_flag);
         rayon::spawn(move || {
             file_paths.par_iter().for_each(|file| {
+                if cancel_flag_clone.load(Ordering::Relaxed) {
+                    return;
+                }
                 media_worker(
                     file.clone(),
                     imgsz,
@@ -212,6 +229,7 @@ async fn process(config: Config, progress_sender: crossbeam_channel::Sender<usiz
                     config.config_options.max_frames,
                     media_q_s.clone(),
                     progress_sender_clone.clone(),
+                    Arc::clone(&cancel_flag_clone),
                 );
             });
             drop(media_q_s);
@@ -308,6 +326,7 @@ async fn process(config: Config, progress_sender: crossbeam_channel::Sender<usiz
             }
             Err(e) => {
                 log::error!("Error receiving detection: {}", e);
+                cancel_flag.store(true, Ordering::Relaxed);
                 drop(export_q_s);
                 while !*finish_clone.lock().unwrap() {
                     thread::sleep(Duration::from_millis(100));
@@ -321,6 +340,12 @@ async fn process(config: Config, progress_sender: crossbeam_channel::Sender<usiz
                 break;
             }
         }
+    }
+
+    if cancel_flag.load(Ordering::Relaxed) {
+        return Err(anyhow::anyhow!(
+            "Processing stopped because media channel was disconnected"
+        ));
     }
 
     log::info!("Elapsed time: {:?}", start.elapsed());
