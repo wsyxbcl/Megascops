@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -88,23 +89,35 @@ pub fn export_worker(
     export_q_r: crossbeam_channel::Receiver<ExportFrame>,
     export_data: &Arc<Mutex<Vec<ExportFrame>>>,
 ) {
+    let mut updated_files = HashSet::new();
     loop {
         match export_q_r.recv() {
             Ok(export_frame) => {
+                let mut export_data = export_data.lock().unwrap();
+                replace_file_rows(&mut export_data, &export_frame, &mut updated_files);
                 let mut checkpoint_counter = checkpoint_counter.lock().unwrap();
                 if *checkpoint_counter % checkpoint == 0 && *checkpoint_counter != 0 {
-                    let export_data = export_data.lock().unwrap();
                     log::info!("Exported {} frames", export_data.len());
                     match format {
                         ExportFormat::Json => write_json(&export_data, folder_path).unwrap(),
                         ExportFormat::Csv => write_csv(&export_data, folder_path).unwrap(),
                     }
                 }
-                export_data.lock().unwrap().push(export_frame);
+                export_data.push(export_frame);
                 *checkpoint_counter += 1;
             }
             Err(_) => break,
         }
+    }
+}
+
+fn replace_file_rows(
+    export_data: &mut Vec<ExportFrame>,
+    export_frame: &ExportFrame,
+    updated_files: &mut HashSet<FileItem>,
+) {
+    if updated_files.insert(export_frame.file.clone()) {
+        export_data.retain(|frame| frame.file != export_frame.file);
     }
 }
 
