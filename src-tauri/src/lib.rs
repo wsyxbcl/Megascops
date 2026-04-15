@@ -1,6 +1,9 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -29,7 +32,7 @@ pub mod io;
 pub mod media;
 pub mod utils;
 
-pub use export::{export_worker, parse_export_csv, Bbox, ExportFrame};
+pub use export::{export_worker, finalize_run, parse_export_csv, Bbox, ExportFrame, ProcessSummary};
 pub use media::{media_worker, WebpItem};
 pub use utils::FileItem;
 
@@ -108,7 +111,10 @@ async fn create_grpc_client(grpc_url: &str) -> Result<Channel> {
         .context("Failed to connect to server")
 }
 
-async fn process(config: Config, progress_sender: crossbeam_channel::Sender<usize>) -> Result<()> {
+async fn process(
+    config: Config,
+    progress_sender: crossbeam_channel::Sender<usize>,
+) -> Result<Option<ProcessSummary>> {
     let channel = create_grpc_client(&config.detect_options.grpc_url).await?;
 
     let mut client = Md5rsClient::new(channel);
@@ -120,7 +126,7 @@ async fn process(config: Config, progress_sender: crossbeam_channel::Sender<usiz
 
     if config.config_options.check_point == 0 {
         log::error!("Checkpoint should be greater than 0");
-        return Ok(());
+        return Ok(None);
     }
 
     let folder_path = std::path::PathBuf::from(&config.detect_options.selected_folder);
@@ -130,6 +136,7 @@ async fn process(config: Config, progress_sender: crossbeam_channel::Sender<usiz
     let start = Instant::now();
 
     let mut file_paths = utils::index_files_and_folders(&folder_path)?;
+    let total_files = file_paths.len();
 
     let export_data = Arc::new(Mutex::new(Vec::new()));
     let frames = Arc::new(Mutex::new(HashMap::<String, ExportFrame>::new()));
@@ -147,12 +154,18 @@ async fn process(config: Config, progress_sender: crossbeam_channel::Sender<usiz
         }
         None => file_paths,
     };
+    let skipped_files = total_files.saturating_sub(file_paths.len());
+    let run_files = file_paths
+        .iter()
+        .map(|file| file.file_path.clone())
+        .collect::<HashSet<_>>();
 
     let (media_q_s, media_q_r) = bounded(8);
     let (io_q_s, io_q_r) = bounded(config.config_options.buffer_size);
     let (export_q_s, export_q_r) = unbounded();
     let checkpoint_counter = Arc::new(Mutex::new(0 as usize));
     let progress_sender_clone = progress_sender.clone();
+    let cancel_flag = Arc::new(AtomicBool::new(false));
 
     let buffer_path = config.config_options.buffer_path.clone();
     let folder_path_clone = folder_path.clone();
@@ -177,18 +190,27 @@ async fn process(config: Config, progress_sender: crossbeam_channel::Sender<usiz
     });
 
     if let Some(buffer_path) = buffer_path {
+        let cancel_flag_clone = Arc::clone(&cancel_flag);
+        let export_q_s_for_media = export_q_s.clone();
         rayon::spawn(move || {
             std::fs::create_dir_all(&buffer_path).unwrap();
             let buffer_path = std::fs::canonicalize(buffer_path).unwrap();
 
+            let cancel_for_io = Arc::clone(&cancel_flag_clone);
             let io_handle = thread::spawn(move || {
                 for file in file_paths.iter() {
+                    if cancel_for_io.load(Ordering::Relaxed) {
+                        break;
+                    }
                     io::io_worker(&buffer_path, file, io_q_s.clone()).unwrap();
                 }
                 drop(io_q_s);
             });
 
             io_q_r.iter().par_bridge().for_each(|file| {
+                if cancel_flag_clone.load(Ordering::Relaxed) {
+                    return;
+                }
                 media_worker(
                     file,
                     imgsz,
@@ -196,14 +218,21 @@ async fn process(config: Config, progress_sender: crossbeam_channel::Sender<usiz
                     config.config_options.iframe_only,
                     config.config_options.max_frames,
                     media_q_s.clone(),
+                    export_q_s_for_media.clone(),
                     progress_sender_clone.clone(),
+                    Arc::clone(&cancel_flag_clone),
                 );
             });
             io_handle.join().unwrap();
         });
     } else {
+        let cancel_flag_clone = Arc::clone(&cancel_flag);
+        let export_q_s_for_media = export_q_s.clone();
         rayon::spawn(move || {
             file_paths.par_iter().for_each(|file| {
+                if cancel_flag_clone.load(Ordering::Relaxed) {
+                    return;
+                }
                 media_worker(
                     file.clone(),
                     imgsz,
@@ -211,7 +240,9 @@ async fn process(config: Config, progress_sender: crossbeam_channel::Sender<usiz
                     config.config_options.iframe_only,
                     config.config_options.max_frames,
                     media_q_s.clone(),
+                    export_q_s_for_media.clone(),
                     progress_sender_clone.clone(),
+                    Arc::clone(&cancel_flag_clone),
                 );
             });
             drop(media_q_s);
@@ -265,9 +296,11 @@ async fn process(config: Config, progress_sender: crossbeam_channel::Sender<usiz
         Err(status) => {
             log::error!("{}", status.message());
             cleanup_buffer(&config.config_options.buffer_path)?;
-            return Ok(());
+            return Ok(None);
         }
     };
+
+    let mut summary = None;
 
     loop {
         match inbound.message().await {
@@ -298,24 +331,31 @@ async fn process(config: Config, progress_sender: crossbeam_channel::Sender<usiz
                 while !*finish_clone.lock().unwrap() {
                     thread::sleep(Duration::from_millis(100));
                 }
-                export::export(
+                summary = Some(export::finalize_run(
                     &folder_path_clone,
                     export_data_clone,
                     &config.config_options.export_format,
-                )?;
+                    &run_files,
+                    total_files,
+                    skipped_files,
+                )?);
                 cleanup_buffer(&config.config_options.buffer_path)?;
                 break;
             }
             Err(e) => {
                 log::error!("Error receiving detection: {}", e);
+                cancel_flag.store(true, Ordering::Relaxed);
                 drop(export_q_s);
                 while !*finish_clone.lock().unwrap() {
                     thread::sleep(Duration::from_millis(100));
                 }
-                export::export(
+                let _ = export::finalize_run(
                     &folder_path_clone,
                     export_data_clone,
                     &config.config_options.export_format,
+                    &run_files,
+                    total_files,
+                    skipped_files,
                 )?;
                 cleanup_buffer(&config.config_options.buffer_path)?;
                 break;
@@ -323,8 +363,14 @@ async fn process(config: Config, progress_sender: crossbeam_channel::Sender<usiz
         }
     }
 
+    if cancel_flag.load(Ordering::Relaxed) {
+        return Err(anyhow::anyhow!(
+            "Processing stopped because media channel was disconnected"
+        ));
+    }
+
     log::info!("Elapsed time: {:?}", start.elapsed());
-    Ok(())
+    Ok(summary)
 }
 
 async fn auth(client: &mut Md5rsClient<Channel>, token: &str) -> Result<AuthResponse> {
@@ -415,20 +461,24 @@ fn resume_from_checkpoint<'a>(
                 }
                 let mut file_frame_count = HashMap::new();
                 let mut file_total_frames = HashMap::new();
+                let mut file_has_error = HashMap::new();
                 for f in &frames {
                     let file = &f.file;
+                    if f.error.is_some() {
+                        file_has_error.insert(file.clone(), true);
+                        continue;
+                    }
                     let count = file_frame_count.entry(file.clone()).or_insert(0);
                     *count += 1;
                     file_total_frames
                         .entry(file.clone())
                         .or_insert(f.total_frames);
-
-                    if let Some(total_frames) = file_total_frames.get(&file) {
-                        if let Some(frame_count) = file_frame_count.get(&file) {
-                            if total_frames == frame_count {
-                                all_files.remove(&file);
-                            }
-                        }
+                }
+                for (file, total_frames) in file_total_frames.iter() {
+                    let frame_count = file_frame_count.get(file).copied().unwrap_or(0);
+                    let has_error = file_has_error.get(file).copied().unwrap_or(false);
+                    if !has_error && *total_frames == frame_count {
+                        all_files.remove(file);
                     }
                 }
                 export_data.lock().unwrap().extend_from_slice(&frames);
@@ -504,7 +554,10 @@ async fn process_media(app: AppHandle, config: Config) {
     });
 
     match process(config, progress_sender).await {
-        Ok(_) => {
+        Ok(Some(summary)) => {
+            app.emit("detect-complete", summary).unwrap();
+        }
+        Ok(None) => {
             app.emit("detect-complete", 1).unwrap();
         }
         Err(e) => {
